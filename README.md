@@ -11,10 +11,14 @@ git clone https://github.com/Wwaallker/Cribbage_ML-public.git
 cd Cribbage_ML-public
 python3 -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: much smaller download
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu   # Windows/Linux; skip on Mac
 pip install -r requirements.txt
 python hud.py                        # then [1] Play vs AI
 ```
+Install the CPU-only PyTorch first, as above. A plain `pip install -r requirements.txt`
+pulls the GPU build, which brings about 5 GB of NVIDIA libraries the game never uses
+(about 7 GB installed in total, versus about 1 GB). On a Mac, PyTorch is CPU-only anyway,
+so skip that line.
 - Type cards as rank + suit: `5H`, `TC` or `10D`, `QS`. Discard two at once: `5H TC`.
 - `tab` shows or hides the AI's hand, `menu` goes back, `quit` exits.
 - Make the terminal tall (about 40 lines) so the whole table fits.
