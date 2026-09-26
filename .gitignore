@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+models/logs/
+models/*.log
+models/current.zip
+models/snapshots/
+models/metrics*.json

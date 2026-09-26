@@ -1,0 +1,12 @@
+{
+  "total_steps": 19800000,
+  "sessions": 1,
+  "history": [
+    {
+      "session": 1,
+      "session_steps": 19800000,
+      "lifetime_steps": 19800000,
+      "winrate_vs_smart": 32.2
+    }
+  ]
+}

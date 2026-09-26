@@ -1,0 +1,7 @@
+gymnasium==1.2.3
+numpy==2.4.2
+pandas==3.0.1
+plotext==5.3.2
+sb3-contrib==2.9.0
+stable-baselines3==2.9.0
+torch==2.10.0
