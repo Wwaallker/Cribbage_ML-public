@@ -1,6 +1,6 @@
 {
-  "total_steps": 59600000,
-  "sessions": 2,
+  "total_steps": 782400000,
+  "sessions": 8,
   "history": [
     {
       "session": 1,
@@ -13,6 +13,42 @@
       "session_steps": 39800000,
       "lifetime_steps": 59600000,
       "winrate_vs_smart": 33.4
+    },
+    {
+      "session": 3,
+      "session_steps": 106200000,
+      "lifetime_steps": 165800000,
+      "winrate_vs_smart": 34.7
+    },
+    {
+      "session": 4,
+      "session_steps": 69000000,
+      "lifetime_steps": 234800000,
+      "winrate_vs_smart": 39.3
+    },
+    {
+      "session": 5,
+      "session_steps": 139200000,
+      "lifetime_steps": 374000000,
+      "winrate_vs_smart": 42.7
+    },
+    {
+      "session": 6,
+      "session_steps": 13800000,
+      "lifetime_steps": 387800000,
+      "winrate_vs_smart": null
+    },
+    {
+      "session": 7,
+      "session_steps": 212200000,
+      "lifetime_steps": 600000000,
+      "winrate_vs_smart": 42.9
+    },
+    {
+      "session": 8,
+      "session_steps": 182400000,
+      "lifetime_steps": 782400000,
+      "winrate_vs_smart": 42.05
     }
   ]
 }

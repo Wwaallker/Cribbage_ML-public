@@ -7,3 +7,4 @@ models/*.log
 models/current.zip
 models/snapshots/
 models/metrics*.json
+models/teacher/

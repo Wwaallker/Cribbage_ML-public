@@ -16,6 +16,8 @@ N_ENVS = 14
 TRAIN_OPPONENT = "smart"
 CHUNK_STEPS = 200_000            # train this many steps, then check the clock
 NET_ARCH = [256, 256]            # separate policy and value nets of this shape
+TORCH_THREADS = 8                # for the network update; measured fastest with 14 envs on 16 cores
+BATCH_SIZE = 1024                # minibatch per gradient step (was 256; fewer, steadier updates)
 
 
 def make_env(opponent):
@@ -43,7 +45,7 @@ if __name__ == "__main__":
     parser.add_argument("--hours", type=float, default=1.0, help="How long to train, in hours")
     args = parser.parse_args()
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(TORCH_THREADS)
     os.makedirs(LOG_DIR, exist_ok=True)
 
     state = load_state()
@@ -54,10 +56,11 @@ if __name__ == "__main__":
     if os.path.exists(MODEL_PATH + ".zip"):
         print(f"Resuming from {MODEL_PATH}.zip (lifetime steps so far: {state['total_steps']:,})")
         model = MaskablePPO.load(MODEL_PATH, env=env, device="cpu")
+        model.batch_size = BATCH_SIZE       # a loaded model keeps the batch size it was saved with
     else:
         print("No existing model found — starting fresh.")
         model = MaskablePPO("MlpPolicy", env, verbose=0, device="cpu",
-                             n_steps=1024, batch_size=256, n_epochs=8,
+                             n_steps=1024, batch_size=BATCH_SIZE, n_epochs=8,
                              gamma=0.999, learning_rate=0.0003,
                              policy_kwargs=dict(net_arch=NET_ARCH))
 

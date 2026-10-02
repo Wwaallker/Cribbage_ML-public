@@ -1,0 +1,24 @@
+{
+  "total_steps": 165800000,
+  "sessions": 3,
+  "history": [
+    {
+      "session": 1,
+      "session_steps": 19800000,
+      "lifetime_steps": 19800000,
+      "winrate_vs_smart": 32.2
+    },
+    {
+      "session": 2,
+      "session_steps": 39800000,
+      "lifetime_steps": 59600000,
+      "winrate_vs_smart": 33.4
+    },
+    {
+      "session": 3,
+      "session_steps": 106200000,
+      "lifetime_steps": 165800000,
+      "winrate_vs_smart": 34.7
+    }
+  ]
+}

@@ -29,7 +29,12 @@ OBS_BLOCKS = [
     ("opp_cards_left", 5),  # one-hot 0-4 cards left in the computer's hand (pegging only)
     ("hand_slots", 6 * 17), # sorted hand, slot by slot: 13 rank + 4 suit one-hot. Lets the
                             # network tie each DISCARD_PAIRS action to concrete cards.
+    # Pegging help, per card the AI could legally play now (scaled by PEG_SCALE, capped at 1).
+    # Added after the rest so older models can be grown to fit (tools/grow_obs.py).
+    ("peg_now", 52),        # points the card scores as it's played
+    ("peg_reply", 52),      # expected points of the computer's best reply to it
 ]
+PEG_SCALE = 1 / 12.0
 OBS = {}
 _off = 0
 for _name, _size in OBS_BLOCKS:
@@ -113,6 +118,13 @@ class CribbageEnv(gym.Env):
             base = OBS["hand_slots"] + slot * 17
             obs[base + c % 13] = 1.0
             obs[base + 13 + c // 13] = 1.0
+
+        if self.phase == 1:
+            for c in self._legal_cards(self.hand):
+                now = self._peg_points(self.pegging_table + [c])
+                reply = self._expected_best_reply(c, self.hand, self.crib[:2], len(self.comp_hand))
+                obs[OBS["peg_now"] + c] = min(now * PEG_SCALE, 1.0)
+                obs[OBS["peg_reply"] + c] = min(reply * PEG_SCALE, 1.0)
         return obs
 
     def action_masks(self):
@@ -249,17 +261,23 @@ class CribbageEnv(gym.Env):
     def _expected_reply(self, card):
         """ Expected points of the AI's best pegging reply if the computer plays `card`,
         assuming the AI's remaining cards are a random draw from the unseen cards. """
-        n_opp = len(self.hand)                  # card count is public info
+        return self._expected_best_reply(card, self.comp_hand, self.crib[2:], len(self.hand))
+
+    def _expected_best_reply(self, card, own_hand, own_discards, n_opp):
+        """ Expected points of the other player's best pegging reply if `card` is played now,
+        seen from the side holding own_hand (who threw own_discards to the crib). The other
+        player's n_opp cards (a public count) are treated as a random draw from the cards
+        that side hasn't seen. """
         if n_opp == 0:
             return 0.0
-        seen = set(self.comp_hand) | set(self.peg_history) | set(self.crib[2:])   # crib[2:] = comp's own discards
+        seen = set(own_hand) | set(self.peg_history) | set(own_discards)
         if self.starter_card != -1:
             seen.add(self.starter_card)
         unseen = [u for u in range(52) if u not in seen]
 
         table = self.pegging_table + [card]
         new_sum = self.current_peg_sum + self._card_value(card)
-        if new_sum == 31:                       # count resets; AI leads fresh, can't score off this card
+        if new_sum == 31:                       # count resets; the reply leads fresh, can't score off this card
             return 0.0
 
         # points each rank would score as a reply, and how many unseen cards have that rank
@@ -270,7 +288,7 @@ class CribbageEnv(gym.Env):
         for r, entry in by_rank.items():
             entry[0] = self._peg_points(table + [r])     # rank r, suit 0 -- suit doesn't matter in pegging
 
-        # E[best reply] = sum over ranks, best first, of pts * P(this is the best rank the AI holds)
+        # E[best reply] = sum over ranks, best first, of pts * P(this is the best rank they hold)
         total = len(unseen)
         denom = math.comb(total, n_opp)
         exp, excluded, p_none_prev = 0.0, 0, 1.0
