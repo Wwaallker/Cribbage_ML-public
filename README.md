@@ -70,7 +70,7 @@ python -m tests.test_env        # likewise tests.test_discard, tests.test_peggin
 |---|---|---|---|---|
 | `archive/v1_680M/` | 193 | 680M | ~39% | one-card discards; not loadable by the current env |
 | `archive/v2_168M/` | 456 | 168M | 34.7% | pair discards; grown into the current model |
-| `current.zip` | 560 | 782M | 42.1% | v2 plus the pegging inputs, batch size 1024 |
+| `current.zip` | 560 | 1.25B | 43.4% | v2 plus the pegging inputs, batch size 1024 |
 
 ## Roadmap
 - **Discard teacher** (`tools/discard_teacher.py`, in progress). Rates all 15 discards of a hand
