@@ -1,10 +1,12 @@
+import json
 import os
 import sys
 from sb3_contrib import MaskablePPO
-from cribbage import CribbageEnv
+from cribbage.env import CribbageEnv     # always the Python engine: the human replaces the computer's methods
 from cribbage.board import replay, event_text
-from cribbage.env import hand_sort_key
-from cribbage.paths import MODEL_PATH, RELEASE_MODEL_PATH
+from cribbage.env import hand_sort_key, DISCARD_PAIRS, N_CARDS
+from cribbage.paths import MODEL_PATH, RELEASE_MODEL_PATH, REPLAY_DIR
+from cribbage.seeds import new_key, normalise, key_to_seed
 from cribbage.ui import (clear_screen, BANNER, RED, GREEN, YELLOW, DIM, BOLD, RESET, card_str, parse_card_code,
                          score_bar, card_box_lines, hand_row_lines, print_hand_row, side_by_side,
                          section, rule)
@@ -20,7 +22,7 @@ def print_board(env, state, header="", error=""):
     clear_screen()
     dealer = "YOU" if not env.is_ai_dealer else "AI"
     print(f" {RED}{BOLD}▓▒░ DEAL {env.deals}  //  {'DISCARD' if env.phase == 0 else 'PEGGING'} ░▒▓{RESET}"
-          f"   {DIM}dealer: {dealer}{RESET}")
+          f"   {DIM}dealer: {dealer}   seed: {state['replay']['seed']}   move {len(state['replay']['moves']) + 1}{RESET}")
     rule()
     print(f" AI    {score_bar(env.p1_score, color=RED)}  {env.p1_score:>3}/121")
     print(f" YOU   {score_bar(env.comp_score)}  {env.comp_score:>3}/121")
@@ -195,6 +197,44 @@ def record_scores(env, state):
     env._award = award_and_record
 
 
+def ask_seed_key():
+    """ A seed key typed by the player, or a fresh random one if they just press enter. """
+    error = ""
+    while True:
+        if error:
+            print(f" {RED}{error}{RESET}")
+        raw = input(f"{YELLOW}Seed key (press enter for a random game): {RESET}").strip()
+        if raw.lower() == "menu":
+            raise ReturnToMenu()
+        if not raw:
+            return new_key()
+        try:
+            return normalise(raw)
+        except ValueError as e:
+            error = str(e)
+
+
+def record_move(state, by, **move):
+    """ Appends a move to the game's replay file, saving it at once so that it survives a crash
+    or a Ctrl+C. tools/replay_game.py rebuilds any position from it. """
+    state["replay"]["moves"].append({"by": by, **move})
+    os.makedirs(REPLAY_DIR, exist_ok=True)
+    with open(state["replay_path"], "w") as f:
+        json.dump(state["replay"], f, indent=1)
+
+
+def human_discard_recorded(env, state):
+    cards = human_discard(env, state)
+    record_move(state, "you", cards=[int(c) for c in cards], text=" ".join(card_str(c) for c in cards))
+    return cards
+
+
+def human_pick_recorded(env, legal, state):
+    card = human_pick(env, legal, state)
+    record_move(state, "you", cards=[int(card)], text=card_str(card))
+    return card
+
+
 def replay_deal(env, state, title):
     """ The board replay, with the game result under it if the game is over. """
     footer = result_lines(env) if env.game_over else ()
@@ -218,14 +258,18 @@ def play_game():
     print(f"{DIM}Loading model...{RESET}")
     model = MaskablePPO.load(model_path, device="cpu")
 
+    key = ask_seed_key()
     env = CribbageEnv(opponent="smart")   # computer brain is replaced by you, below
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=key_to_seed(key))
 
     state = {"show_ai_hand": True, "last_ai": None,
              "pegs": {0: (0, 0), 1: (0, 0)},      # (front, back) peg per player
-             "events": [], "count_labels": [], "replayed_end": False}
-    env._comp_discard = lambda: human_discard(env, state)
-    env._comp_pick = lambda legal: human_pick(env, legal, state)
+             "events": [], "count_labels": [], "replayed_end": False,
+             "replay": {"seed": key, "model": os.path.relpath(model_path + ".zip", os.path.dirname(REPLAY_DIR)),
+                        "model_steps": int(model.num_timesteps), "moves": []},
+             "replay_path": os.path.join(REPLAY_DIR, f"{key}.json")}
+    env._comp_discard = lambda: human_discard_recorded(env, state)
+    env._comp_pick = lambda legal: human_pick_recorded(env, legal, state)
 
     count_hands = env._count_hands
 
@@ -245,12 +289,19 @@ def play_game():
     done = trunc = False
     while not (done or trunc):
         action, _ = model.predict(obs, action_masks=env.action_masks(), deterministic=True)
+        action = int(action)
         if env.phase == 1:
-            state["last_ai"] = card_str(int(action))     # shown on the board at your next prompt
-        obs, r, done, trunc, info = env.step(int(action))
+            state["last_ai"] = card_str(action)          # shown on the board at your next prompt
+            record_move(state, "ai", action=action, text=card_str(action))
+        else:
+            i, j = DISCARD_PAIRS[action - N_CARDS]
+            record_move(state, "ai", action=action, text=f"{card_str(env.hand[i])} {card_str(env.hand[j])}")
+        obs, r, done, trunc, info = env.step(action)
 
     if not state["replayed_end"]:                       # game ended before the counts
         replay_deal(env, state, f"DEAL {env.deals} // FINAL")
+    print(f"{DIM}Seed key {key}. Every move is saved in {os.path.relpath(state['replay_path'])}{RESET}")
+    input(f"{DIM}(press enter to continue){RESET}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+import json
+import os
 import random
 import itertools
 import math
@@ -33,8 +35,21 @@ OBS_BLOCKS = [
     # Added after the rest so older models can be grown to fit (tools/grow_obs.py).
     ("peg_now", 52),        # points the card scores as it's played
     ("peg_reply", 52),      # expected points of the computer's best reply to it
+    # Discard help (discard phase only), one per DISCARD_PAIRS action: how close that discard
+    # comes to the best one, 1 / (1 + points lost vs the best / DISCARD_HALF). 1 for the best,
+    # 0.5 at DISCARD_HALF points worse. See CribbageEnv.discard_values.
+    ("discard_value", 15),
 ]
 PEG_SCALE = 1 / 12.0
+DISCARD_HALF = 0.5
+
+# Average crib points for each kind of 2-card throw ("rank,rank,suited"), built by simulation
+# (tools/discard_teacher.py makes it if missing). Used by discard_values.
+CRIB_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crib_table.json")
+CRIB_TABLE = {}
+if os.path.exists(CRIB_TABLE_PATH):
+    with open(CRIB_TABLE_PATH) as _f:
+        CRIB_TABLE = json.load(_f)
 OBS = {}
 _off = 0
 for _name, _size in OBS_BLOCKS:
@@ -43,9 +58,39 @@ for _name, _size in OBS_BLOCKS:
 OBS_SIZE = _off
 
 
+def throw_key(a, b):
+    """ What matters about a 2-card throw for the crib: the two ranks and whether suited. """
+    ra, rb = sorted((a % 13, b % 13))
+    return f"{ra},{rb},{int(a // 13 == b // 13)}"
+
+
 def hand_sort_key(card):
     """ Rank first, then suit -- the order hand slots (and so discard-pair actions) refer to. """
     return (card % 13, card // 13)
+
+
+class OpponentNet:
+    """ A trained model playing the computer's seat: its policy network (two tanh layers, then
+    the action logits), exported by tools/export_opponent.py. Deterministic: the legal action
+    with the highest logit, the lowest action on a tie. Computed in float64 so the Rust engine
+    makes the same choices. """
+
+    def __init__(self, path):
+        z = np.load(path)
+        self.path = path
+        self.layers = [(z[f"w{k}"].astype(np.float64), z[f"b{k}"].astype(np.float64)) for k in range(3)]
+        if self.layers[0][0].shape[1] != OBS_SIZE:
+            raise ValueError(f"{path} takes {self.layers[0][0].shape[1]} inputs, the env gives {OBS_SIZE}")
+
+    def logits(self, obs):
+        (w0, b0), (w1, b1), (w2, b2) = self.layers
+        h = np.tanh(w0 @ obs.astype(np.float64) + b0)
+        h = np.tanh(w1 @ h + b1)
+        return w2 @ h + b2
+
+    def act(self, obs, actions):
+        logits = self.logits(obs)
+        return max(sorted(actions), key=lambda a: logits[a])
 
 
 class CribbageEnv(gym.Env):
@@ -54,10 +99,12 @@ class CribbageEnv(gym.Env):
     action_space: Discrete(67). 0-51 play that card (pegging); 52-66 discard the hand-slot
         pair DISCARD_PAIRS[a - 52] to the crib (discard phase, one decision per deal).
     observation_space: Box(OBS_SIZE,) -- see OBS_BLOCKS.
-    opponent: "random", "smart", or "mixed" (50/50 chosen at each reset).
+    opponent: "random", "smart", "mixed" (50/50 chosen at each reset), or "pool": at each reset
+        the heuristic with probability p_smart, otherwise a network drawn from `pool` (paths of
+        tools/export_opponent.py files; an empty pool plays the heuristic).
     """
 
-    def __init__(self, opponent="smart"):
+    def __init__(self, opponent="smart", pool=(), p_smart=0.5):
         super().__init__()
         self.action_space = spaces.Discrete(N_ACTIONS)
         self.obs_size = OBS_SIZE
@@ -65,6 +112,10 @@ class CribbageEnv(gym.Env):
 
         self.opponent = opponent
         self.opp_smart = True
+        self.p_smart = p_smart
+        self.pool = []
+        self.opp_net = None             # the network playing this game, if any
+        self.set_pool(pool)
 
         self.phase = 0                  # 0 = discard, 1 = pegging
         self.p1_score = 0
@@ -90,42 +141,76 @@ class CribbageEnv(gym.Env):
     # ------------------------------------------------------------------
     # OBSERVATION / MASKING
     # ------------------------------------------------------------------
-    def _get_obs(self):
+    def _get_obs(self, seat=0):
+        """ What one seat sees, from its own point of view: 0 = the AI (the agent being trained),
+        1 = the computer (for an opponent network). """
         obs = np.zeros(self.obs_size, dtype=np.float32)
 
         def cards(block, cs):
             for c in cs:
                 obs[OBS[block] + c] = 1.0
 
-        cards("hand", self.hand)
+        if seat == 0:
+            hand, other = self.hand, self.comp_hand              # self.hand is kept sorted
+            mine, theirs = self.p1_score, self.comp_score
+            i_deal = self.is_ai_dealer
+            my_start, their_start = self.ai_scoring_hand, self.comp_scoring_hand
+            my_discards = self.crib[:2]                         # the AI always discards first
+        else:
+            hand, other = sorted(self.comp_hand, key=hand_sort_key), self.hand
+            mine, theirs = self.comp_score, self.p1_score
+            i_deal = not self.is_ai_dealer
+            my_start, their_start = self.comp_scoring_hand, self.ai_scoring_hand
+            my_discards = self.crib[2:4]
+
+        cards("hand", hand)
         cards("table", self.pegging_table)
         if self.starter_card != -1:
             obs[OBS["starter"] + self.starter_card] = 1.0
         if 0 <= self.current_peg_sum <= 31:
             obs[OBS["count"] + self.current_peg_sum] = 1.0
-        obs[OBS["scores"]] = min(self.p1_score / float(WIN_SCORE), 1.0)
-        obs[OBS["scores"] + 1] = min(self.comp_score / float(WIN_SCORE), 1.0)
+        obs[OBS["scores"]] = min(mine / float(WIN_SCORE), 1.0)
+        obs[OBS["scores"] + 1] = min(theirs / float(WIN_SCORE), 1.0)
         obs[OBS["phase"] + self.phase] = 1.0
-        obs[OBS["dealer"]] = 1.0 if self.is_ai_dealer else 0.0
+        obs[OBS["dealer"]] = 1.0 if i_deal else 0.0
 
         if self.phase == 1:
-            cards("opp_played", [c for c in self.comp_scoring_hand if c not in self.comp_hand])
-            cards("own_played", [c for c in self.ai_scoring_hand if c not in self.hand])
-            obs[OBS["opp_cards_left"] + len(self.comp_hand)] = 1.0
-        cards("own_discards", self.crib[:2])        # the AI always discards first
+            cards("opp_played", [c for c in their_start if c not in other])
+            cards("own_played", [c for c in my_start if c not in hand])
+            obs[OBS["opp_cards_left"] + len(other)] = 1.0
+        cards("own_discards", my_discards)
 
-        for slot, c in enumerate(self.hand):        # self.hand is kept in hand_sort_key order
+        for slot, c in enumerate(hand):
             base = OBS["hand_slots"] + slot * 17
             obs[base + c % 13] = 1.0
             obs[base + 13 + c // 13] = 1.0
 
         if self.phase == 1:
-            for c in self._legal_cards(self.hand):
+            for c in self._legal_cards(hand):
                 now = self._peg_points(self.pegging_table + [c])
-                reply = self._expected_best_reply(c, self.hand, self.crib[:2], len(self.comp_hand))
+                reply = self._expected_best_reply(c, hand, my_discards, len(other))
                 obs[OBS["peg_now"] + c] = min(now * PEG_SCALE, 1.0)
                 obs[OBS["peg_reply"] + c] = min(reply * PEG_SCALE, 1.0)
+
+        if self.phase == 0 and len(hand) == 6:
+            values = self.discard_values(hand, i_deal)
+            best = max(values)
+            for i, v in enumerate(values):
+                obs[OBS["discard_value"] + i] = 1.0 / (1.0 + (best - v) / DISCARD_HALF)
         return obs
+
+    def discard_values(self, six, owns_crib):
+        """ Expected points of each of the 15 discards of a sorted 6-card hand, in DISCARD_PAIRS
+        order: the kept 4 averaged over all 46 starters, plus the crib table's value of the 2
+        thrown cards (minus it when the other side owns the crib). """
+        unseen = [c for c in range(52) if c not in six]
+        values = []
+        for i, j in DISCARD_PAIRS:
+            keep = [c for k, c in enumerate(six) if k not in (i, j)]
+            hand = sum(self.score_hand(keep, st) for st in unseen) / len(unseen)
+            crib = CRIB_TABLE[throw_key(six[i], six[j])]
+            values.append(hand + (crib if owns_crib else -crib))
+        return values
 
     def action_masks(self):
         """ True = legal action. Used by MaskablePPO. """
@@ -138,6 +223,12 @@ class CribbageEnv(gym.Env):
         if not mask.any():
             mask[:] = True
         return mask
+
+    def set_pool(self, paths):
+        """ The networks an opponent="pool" env draws from (files of tools/export_opponent.py).
+        Takes effect from the next reset. """
+        loaded = {net.path: net for net in self.pool}
+        self.pool = [loaded.get(p) or OpponentNet(p) for p in paths]
 
     def discard_action(self, pair):
         """ The action that discards these 2 cards from the AI's hand (for tests, tools, UIs). """
@@ -159,8 +250,13 @@ class CribbageEnv(gym.Env):
         self.deals = 1
         self.steps = 0
 
+        self.opp_net = None
         if self.opponent == "mixed":
             self.opp_smart = random.random() < 0.5
+        elif self.opponent == "pool":
+            self.opp_smart = True
+            if random.random() >= self.p_smart and self.pool:
+                self.opp_net = self.pool[random.randrange(len(self.pool))]
         else:
             self.opp_smart = (self.opponent == "smart")
 
@@ -226,6 +322,10 @@ class CribbageEnv(gym.Env):
         Considers not just the kept hand's value, but whether the crib
         being fed is the computer's own (favor pairs/15s in the discard)
         or the opponent's (favor throwing dead cards). """
+        if self.opp_net is not None:
+            six = sorted(self.comp_hand, key=hand_sort_key)
+            i, j = DISCARD_PAIRS[self.opp_net.act(self._get_obs(1), range(N_CARDS, N_ACTIONS)) - N_CARDS]
+            return [six[i], six[j]]
         if not self.opp_smart:
             return random.sample(self.comp_hand, 2)
 
@@ -248,6 +348,8 @@ class CribbageEnv(gym.Env):
         2-ply: points scored now, minus the expected points of the AI's best
         reply. The AI's hand is never peeked at -- replies are drawn from the
         cards the computer hasn't seen, weighted by how likely the AI holds them. """
+        if self.opp_net is not None:
+            return self.opp_net.act(self._get_obs(1), legal)
         if not self.opp_smart:
             return random.choice(legal)
         best_card, best_val = None, -99.0

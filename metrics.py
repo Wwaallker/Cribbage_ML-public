@@ -67,38 +67,30 @@ def play_games(args):
     points = {src: [0, 0] for src in ("pegging", "hand", "crib", "his heels")}   # [ai, opp]
     source = {"now": None, "counts": []}
 
-    award = env._award
+    if not hasattr(env, "points_by_source"):
+        # Python engine: tally points by wrapping _award. (The Rust engine tallies them itself.)
+        award = env._award
 
-    def award_tracked(player, pts):
-        if source["counts"]:
-            src = source["counts"].pop(0)
-        elif env.phase == 0:
-            src = "his heels"
-        else:
-            src = "pegging"
-        if pts and not env.game_over:
-            points[src][player] += pts
-        return award(player, pts)
-    env._award = award_tracked
+        def award_tracked(player, pts):
+            if source["counts"]:
+                src = source["counts"].pop(0)
+            elif env.phase == 0:
+                src = "his heels"
+            else:
+                src = "pegging"
+            if pts and not env.game_over:
+                points[src][player] += pts
+            return award(player, pts)
+        env._award = award_tracked
 
-    count_hands = env._count_hands
+        count_hands = env._count_hands
 
-    def count_tracked():
-        source["counts"] = ["hand", "hand", "crib"]
-        r = count_hands()
-        source["counts"] = []
-        return r
-    env._count_hands = count_tracked
-
-    comp_discard = env._comp_discard
-
-    def comp_discard_rated():
-        pair = comp_discard()
-        if rate_discards:
-            vals = discard_values(env, list(env.comp_hand), not env.is_ai_dealer, rng)
-            discards["opp"].append(rate(vals, pair))
-        return pair
-    env._comp_discard = comp_discard_rated
+        def count_tracked():
+            source["counts"] = ["hand", "hand", "crib"]
+            r = count_hands()
+            source["counts"] = []
+            return r
+        env._count_hands = count_tracked
 
     for g in range(first, first + count):
         obs, _ = env.reset(seed=EVAL_SEED + g)
@@ -106,12 +98,21 @@ def play_games(args):
         while not (done or trunc):
             a, _ = model.predict(obs, action_masks=env.action_masks(), deterministic=True)
             a = int(a)
-            if env.phase == 0 and rate_discards:
+            rate_now = env.phase == 0 and rate_discards
+            if rate_now:
                 i, j = DISCARD_PAIRS[a - 52]
                 chosen = [env.hand[i], env.hand[j]]
                 vals = discard_values(env, list(env.hand), env.is_ai_dealer, rng)
                 discards["ai"].append(rate(vals, chosen))
+                comp_six, comp_is_dealer = list(env.comp_hand), not env.is_ai_dealer
             obs, r, done, trunc, _ = env.step(a)
+            if rate_now:        # the computer discarded during that step: its 2 cards follow the AI's
+                vals = discard_values(env, comp_six, comp_is_dealer, rng)
+                discards["opp"].append(rate(vals, env.crib[2:4]))
+        if hasattr(env, "points_by_source"):
+            for src, (ai_pts, opp_pts) in env.points_by_source().items():
+                points[src][0] += ai_pts
+                points[src][1] += opp_pts
         ai, opp = min(env.p1_score, 121), min(env.comp_score, 121)
         games.append({"won": env.winner == 0, "ai": ai, "opp": opp, "deals": env.deals})
     return games, discards, points
@@ -168,6 +169,22 @@ def run(model_path, opponent, games, rate_discards, workers):
     return summarize(all_games, all_discards, all_points)
 
 
+def measure(model_path, games, workers, vs_random=True, out=METRICS_PATH):
+    """ The full metrics of a saved model, written to `out` and returned. """
+    from sb3_contrib import MaskablePPO
+    steps = MaskablePPO.load(model_path, device="cpu").num_timesteps
+    metrics = {
+        "model": os.path.basename(model_path), "steps": int(steps),
+        "created": time.strftime("%Y-%m-%d %H:%M"),
+        "vs_smart": run(model_path, "smart", games, True, workers),
+    }
+    if vs_random:
+        metrics["vs_random"] = run(model_path, "random", games, False, workers)
+    with open(out, "w") as f:
+        json.dump(metrics, f, indent=2)
+    return metrics
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Detailed metrics for a saved model.")
     parser.add_argument("model", nargs="?", default=MODEL_PATH)
@@ -177,18 +194,9 @@ if __name__ == "__main__":
     parser.add_argument("--out", default=METRICS_PATH)
     args = parser.parse_args()
 
-    from sb3_contrib import MaskablePPO
-    steps = MaskablePPO.load(args.model, device="cpu").num_timesteps
     t0 = time.time()
-    metrics = {
-        "model": os.path.basename(args.model), "steps": int(steps),
-        "created": time.strftime("%Y-%m-%d %H:%M"),
-        "vs_smart": run(args.model, "smart", args.games, True, args.workers),
-    }
-    if not args.no_random:
-        metrics["vs_random"] = run(args.model, "random", args.games, False, args.workers)
-    with open(args.out, "w") as f:
-        json.dump(metrics, f, indent=2)
+    metrics = measure(args.model, args.games, args.workers, not args.no_random, args.out)
+    steps = metrics["steps"]
 
     s = metrics["vs_smart"]
     print(f"{steps:,} steps | {time.time() - t0:.0f}s")

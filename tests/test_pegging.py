@@ -1,6 +1,6 @@
 import random
 import numpy as np
-from cribbage import CribbageEnv
+from cribbage.env import CribbageEnv     # Python engine: _comp_pick is swapped out below
 
 # Isolates the pegging change: the computer plays with the old 1-ply pick vs the new
 # 2-ply pick, against the same 1-ply "AI" stand-in, over identical seeded deals.

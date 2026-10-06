@@ -6,5 +6,8 @@ models/logs/
 models/*.log
 models/current.zip
 models/snapshots/
+models/pool/
 models/metrics*.json
 models/teacher/
+rust/target/
+replays/

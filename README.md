@@ -23,22 +23,31 @@ so skip that line.
 - `tab` shows or hides the AI's hand, `menu` goes back, `quit` exits.
 - Make the terminal tall (about 40 lines) so the whole table fits.
 - On Windows, use Windows Terminal (the old console can't draw the colors).
+- Each game has a seed key (shown at the top, e.g. `K7QM2XPA`). Type a key at the start to get
+  the same deals again. Every move is saved to `replays/<KEY>.json`, and
+  `python -m tools.replay_game replays/<KEY>.json --upto <move>` rebuilds the position just
+  before that move, with every score and its reason: handy for reporting a bug.
 
 ## Layout
 ```
 cribbage/          game package
   env.py           CribbageEnv: rules, scoring, heuristic opponent, observation/actions
+  rust_env.py      the same env with the game engine in Rust (optional, see below)
   ui.py            shared terminal drawing (card boxes, colors, bars)
   board.py         ASCII cribbage board + end-of-deal scoring replay
   paths.py         where models and logs live
+  seeds.py         seed keys (K7QM2XPA) for repeatable games
 train.py           train in timed sessions, resumes models/current.zip, evaluates at the end
 evaluate.py        win % of any saved model over 2000 fixed, seeded games
 metrics.py         win/skunk rates, points by source, discard quality -> models/metrics.json
-tools/             grow_obs.py (grow a model to a bigger observation), publish_public.sh
+rust/              the Rust game engine (PyO3 extension module cribbage_rs)
+tools/             grow_obs.py (grow a model to a bigger observation), discard_teacher.py,
+                   export_opponent.py (a model as a self-play opponent), replay_game.py,
+                   bench_engine.py, publish_public.sh
 play.py            play against the trained AI in the terminal
 hud.py             menu + live training dashboard
 monitor.py         plotext charts of the training log
-tests/             env sanity, discard heuristic, pegging heuristic head-to-head
+tests/             env sanity, discard heuristic, pegging heuristic head-to-head, Rust vs Python engine
 models/            current.zip, training_state.json, logs/ (ignored), archive/,
                    release/cribbage_ai.zip (the model play.py falls back to)
 ```
@@ -48,6 +57,8 @@ Install with `pip install -r requirements.txt`, then run everything from the rep
 ```
 python train.py --hours 2       # train (starts fresh if models/current.zip is missing)
 python evaluate.py              # evaluate models/current (or pass a model path)
+python evaluate.py --vs models/pool/b54.npz   # ... against the frozen 54% model instead
+python train.py --hours 6 --opponent pool     # self-play, see Roadmap
 python metrics.py               # detailed metrics for models/current
 python play.py                  # play vs the AI
 python -m cribbage.board        # demo of the board replay animation
@@ -55,13 +66,30 @@ python hud.py                   # menu + live dashboard while training
 python -m tests.test_env        # likewise tests.test_discard, tests.test_pegging
 ```
 
+## Rust engine (optional, faster training)
+`rust/` holds the game engine of `cribbage/env.py` (rules, scoring, the heuristic opponent,
+observation and masks) in Rust. It plays exactly the same games: it carries a copy of
+Python's random number generator, so a seeded game goes move for move as on the Python engine,
+and `tests/test_rust_engine.py` checks that. Python stays the default and the reference: change
+the rules in `env.py` first, then in `rust/src/`.
+```
+pip install maturin
+(cd rust && maturin develop --release)      # needs cargo / rustc 1.74+
+CRIBBAGE_ENGINE=rust python train.py --hours 2  # likewise evaluate.py, metrics.py
+python -m tests.test_rust_engine            # after any change to either engine
+python -m tools.bench_engine                # speed of both engines
+```
+`play.py` always uses the Python engine, since it swaps the computer's moves for yours.
+
 ## Actions and observation
 - Actions 0-51 play that card while pegging; 52-66 discard one of the 15 pairs of hand slots
   (hand is kept sorted by rank, then suit), so the crib discard is a single decision.
-- The observation (560 values) is described block by block in `OBS_BLOCKS` in `cribbage/env.py`.
-  The last two blocks help with pegging: for each card the AI could play, the points it scores
-  now and the expected points of the opponent's best reply (the same 2-ply lookahead the
-  heuristic opponent uses).
+- The observation (575 values) is described block by block in `OBS_BLOCKS` in `cribbage/env.py`.
+  `peg_now` and `peg_reply` help with pegging: for each card the AI could play, the points it
+  scores now and the expected points of the opponent's best reply (the same 2-ply lookahead the
+  heuristic opponent uses). `discard_value` helps with the crib discard: for each of the 15
+  discards, how close it comes to the best one (kept hand over every starter, plus or minus a
+  crib table, `cribbage/crib_table.json`).
 - New observation blocks go at the end. `python -m tools.grow_obs <old> <new>` then grows a saved
   model to fit, with zero weights on the new inputs, so it keeps everything it has learned.
 
@@ -70,15 +98,20 @@ python -m tests.test_env        # likewise tests.test_discard, tests.test_peggin
 |---|---|---|---|---|
 | `archive/v1_680M/` | 193 | 680M | ~39% | one-card discards; not loadable by the current env |
 | `archive/v2_168M/` | 456 | 168M | 34.7% | pair discards; grown into the current model |
-| `current.zip` | 560 | 1.25B | 43.4% | v2 plus the pegging inputs, batch size 1024 |
+| `snapshots/d1005_obs560_taught.zip` | 560 | 1.25B | 46.6% | v2 plus the pegging inputs, batch size 1024; discard teacher |
+| `current.zip` | 575 | 1.26B | 53.0% | the 560 model plus the discard inputs, discard teacher (--soft-ce) |
 
 ## Roadmap
-- **Discard teacher** (`tools/discard_teacher.py`, in progress). Rates all 15 discards of a hand
-  (kept hand over every starter, plus or minus a crib table) and trains the policy to give up as
-  few expected points as possible, while holding its pegging fixed. On the 377M model
-  (500k hands, 40 epochs), same 1,000 games vs smart: discards 0.72 -> 0.51 pts lost/deal
-  (bot 0.39), best discard 53% -> 60%, pegging unchanged, average margin -3.2 -> -1.5,
-  win 43.0% -> 46.0% (±3.1). Cross-entropy towards the best discard made discards worse.
-- **Self-play.** Train against a pool of earlier versions of itself mixed with the heuristic,
-  so it can end up stronger than the heuristic rather than only learning to handle it.
+- **Discard teacher** (`tools/discard_teacher.py`). Rates all 15 discards of a hand (kept hand
+  over every starter, plus or minus a crib table) and trains the policy towards the best ones,
+  while holding its pegging fixed. With the `discard_value` inputs and `--soft-ce 0.25`
+  (40 epochs) on the 1.25B model, 2000 games vs smart: discards 0.53 -> 0.02 pts lost/deal
+  (bot 0.38), win 46.6% -> 54.0%. PPO loosens the discards again (0.09 after 30 minutes), so
+  re-run the teacher after long sessions.
+- **Self-play** (`train.py --opponent pool`, in progress). Half the games against the heuristic
+  (`--p-smart`), half against a network from `models/pool/`: the frozen 54% model (`b54.npz`)
+  and the newest 8 snapshots of itself, one added every 20M steps (`--pool-every`). The computer
+  seat sees the same 575 inputs from its own side (`_get_obs(seat=1)`); the networks run inside
+  the Rust engine. A model plays its own copy to 49.9% over 10,000 games. Each session reports
+  win % vs smart and vs `b54.npz`.
 - **Per-deal reward.** gamma 0.999 over a ~47-move game spreads credit for a discard thinly.
